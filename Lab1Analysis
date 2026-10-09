@@ -1,0 +1,350 @@
+@author: EChak
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import astropy
+from astropy.io import fits
+from pathlib import Path
+import glob
+
+
+#Part 1: Bias Images
+
+# Folder
+bias_dir = Path(r"C:\ASTR362_Files\biasimages")
+
+print("Folder exists:", bias_dir.exists())
+print("Folder:", bias_dir)
+bias_files = sorted(
+    path for path in bias_dir.iterdir()
+    if path.is_file() and path.suffix.lower() in {".fit", ".fits"})
+
+print("Bias files found:", len(bias_files))
+print("First few files:", bias_files[:5])
+
+if not bias_files:
+    raise FileNotFoundError("No .fit or .fits files found. Check the folder path and file extensions.")
+
+bias_images = []
+
+for path in bias_files:
+    raw = fits.getdata(path)
+    image = raw / 16 + 1
+    bias_images.append(image)
+
+images = np.stack(bias_images)
+print("Bias stack shape:", images.shape)
+
+# Average
+avg_bias = np.mean(images, axis=0)
+print("Average bias shape:", avg_bias.shape)
+
+# Median
+median_bias = np.median(avg_bias)
+print("Median bias value:", median_bias, "ADU")
+
+# Plot
+plt.figure(figsize=(8, 8))
+plt.imshow(avg_bias, cmap="gray", origin="lower")
+plt.colorbar(label="ADU")
+plt.title("Mean Bias Image")
+plt.xlabel("Pixel x")
+plt.ylabel("Pixel y")
+plt.show()
+
+# Part 2: Dark Images
+
+def load_dark_stack(folder):
+    """Load and convert all .fit/.fits images in a folder."""
+    folder = Path(folder)
+
+    if not folder.exists():
+        raise FileNotFoundError(f"Folder does not exist: {folder}")
+
+    dark_files = sorted(
+        path for path in folder.iterdir()
+        if path.is_file() and path.suffix.lower() in {".fit", ".fits"}
+    )
+
+    print(f"\nFolder: {folder}")
+    print(f"Dark files found: {len(dark_files)}")
+    print("First few files:", dark_files[:5])
+
+    if not dark_files:
+        raise FileNotFoundError(f"No .fit or .fits files found in {folder}")
+
+    dark_images = []
+
+    for path in dark_files:
+        raw = fits.getdata(path)
+        image = raw / 16 + 1
+        dark_images.append(image)
+
+    dark_stack = np.stack(dark_images)
+    print("Dark stack shape:", dark_stack.shape)
+
+    return dark_stack
+
+images35 = load_dark_stack(r"C:\ASTR362_Files\Darks_35")
+images10 = load_dark_stack(r"C:\ASTR362_Files\Darks_10")
+
+avg35_dark = np.mean(images35, axis=0)
+avg10_dark = np.mean(images10, axis=0)
+
+print("\nAverage 35-second dark shape:", avg35_dark.shape)
+print("Average 10-second dark shape:", avg10_dark.shape)
+
+dark35_bias_corrected = avg35_dark - avg_bias
+dark10_bias_corrected = avg10_dark - avg_bias
+
+plt.figure(figsize=(8, 8))
+plt.imshow(dark35_bias_corrected, cmap="gray", origin="lower")
+plt.colorbar(label="ADU")
+plt.title("Average 35-Second Dark, Bias Corrected")
+plt.xlabel("Pixel x")
+plt.ylabel("Pixel y")
+plt.show()
+
+plt.figure(figsize=(8, 8))
+plt.imshow(dark10_bias_corrected, cmap="gray", origin="lower")
+plt.colorbar(label="ADU")
+plt.title("Average 10-Second Dark, Bias Corrected")
+plt.xlabel("Pixel x")
+plt.ylabel("Pixel y")
+plt.show()
+
+np.save("dark_35s_bias_corrected.npy", dark35_bias_corrected)
+np.save("dark_10s_bias_corrected.npy", dark10_bias_corrected)
+
+
+# Part 3: Twilight Flats
+
+flat_dir = Path(r"C:\ASTR362_Files\Lab1_TwilightFlats_Sample")
+
+if not flat_dir.exists():
+    raise FileNotFoundError(f"Twilight flats folder does not exist: {flat_dir}")
+    
+flat_files = sorted(
+    path for path in flat_dir.iterdir()
+    if path.is_file() and path.suffix.lower() in {".fit", ".fits"})
+
+print("Twilight flats folder:", flat_dir)
+print("Number of flat files found:", len(flat_files))
+print("Files:", flat_files)
+
+if not flat_files:
+    raise FileNotFoundError("No .fit or .fits files found in the sample folder.")
+
+if "avg_bias" not in globals():
+    raise NameError("Run the bias-image section first so avg_bias is defined.")
+
+flat_hdus = [
+    fits.open(path, memmap=True, do_not_scale_image_data=True)
+    for path in flat_files]
+
+try:
+    number_of_flats = len(flat_hdus)
+    image_height, image_width = avg_bias.shape
+    bias_float = avg_bias.astype(np.float32)
+
+    flat_medians = []
+
+    for path, hdul in zip(flat_files, flat_hdus):
+        header = hdul[0].header
+        bscale = header.get("BSCALE", 1.0)
+        bzero = header.get("BZERO", 0.0)
+
+        raw = hdul[0].data
+
+        if raw.shape != avg_bias.shape:
+            raise ValueError(
+                f"Image shape mismatch for {path}: "
+                f"{raw.shape} versus bias shape {avg_bias.shape}")
+
+        corrected = (
+            raw.astype(np.float32) * bscale + bzero
+        ) / 16.0 + 1.0 - bias_float
+
+        flat_median = np.median(corrected)
+
+        if flat_median == 0:
+            raise ValueError(f"Bias-corrected median is zero for {path}")
+
+        flat_medians.append(flat_median)
+        del corrected
+
+    print("Image shape:", avg_bias.shape)
+    print("Flat medians:", flat_medians)
+
+    median_normalized_flat = np.empty(
+        (image_height, image_width),
+        dtype=np.float32)
+
+    rows_per_strip = 16
+
+    for y0 in range(0, image_height, rows_per_strip):
+        y1 = min(y0 + rows_per_strip, image_height)
+        bias_strip = bias_float[y0:y1, :]
+
+        normalized_strip_stack = np.empty(
+            (number_of_flats, y1 - y0, image_width),
+            dtype=np.float32)
+
+        for i, hdul in enumerate(flat_hdus):
+            header = hdul[0].header
+            bscale = header.get("BSCALE", 1.0)
+            bzero = header.get("BZERO", 0.0)
+
+            raw_strip = hdul[0].data[y0:y1, :]
+
+            corrected_strip = (raw_strip.astype(np.float32) * bscale + bzero) / 16.0 + 1.0 - bias_strip
+
+            normalized_strip_stack[i] = corrected_strip / flat_medians[i]
+
+        median_normalized_flat[y0:y1, :] = np.median(
+            normalized_strip_stack,
+            axis=0)
+
+        print(f"Processed rows {y0} to {y1 - 1}")
+        del normalized_strip_stack
+
+finally:
+    for hdul in flat_hdus:
+        hdul.close()
+
+
+print("Median normalized flat shape:", median_normalized_flat.shape)
+y0, x0 = 1000, 1000
+size = 200
+flat_region = median_normalized_flat[y0:y0 + size, x0:x0 + size]
+
+plt.figure(figsize=(8, 8))
+plt.imshow(flat_region, cmap="gray", origin="lower")
+plt.colorbar(label="Normalized value")
+plt.title("Small Region of Median Normalized Flat")
+plt.xlabel("Pixel x within region")
+plt.ylabel("Pixel y within region")
+plt.show()
+
+np.save("median_normalized_flat_sample.npy", median_normalized_flat)
+
+
+#Part 4: Random Error
+
+bias_a = fits.getdata(bias_files[0]) / 16 + 1
+bias_b = fits.getdata(bias_files[1]) / 16 + 1
+bias_difference = bias_a - bias_b
+
+print("Mean Difference:", np.mean(bias_difference))
+plt.hist(bias_difference.ravel(), bins=100)
+plt.xlabel("Difference (ADU)")
+plt.ylabel("Number of Pixels")
+plt.title("Difference of Two Bias Images")
+plt.show()
+
+sigma_diff = np.std(bias_difference)
+print("Difference Image STD:", sigma_diff, "ADU")
+
+read_noise = sigma_diff / np.sqrt(2)
+print("Read Noise:", read_noise, "ADU")
+
+#Part 5: Correcting Science Images
+
+science_files = [
+    Path(r"C:\ASTR362_Files\denebimages-0003.fit"),
+    Path(r"C:\ASTR362_Files\POph-0001.fit"),
+    Path(r"C:\ASTR362_Files\Lab 1 Images\shaedirimages-0003.fit"),
+]
+
+dark_by_exposure = {
+    10: dark10_bias_corrected,
+    35: dark35_bias_corrected,
+}
+
+if "avg_bias" not in globals():
+    raise NameError("Run the bias section first so avg_bias is defined.")
+
+if "median_normalized_flat" not in globals():
+    raise NameError(
+        "Run the twilight-flat section first so median_normalized_flat is defined."
+    )
+
+for duration, dark_image in dark_by_exposure.items():
+    if dark_image.shape != avg_bias.shape:
+        raise ValueError(
+            f"The {duration}-second dark shape {dark_image.shape} "
+            f"does not match the bias shape {avg_bias.shape}."
+        )
+
+if median_normalized_flat.shape != avg_bias.shape:
+    raise ValueError(
+        f"The flat shape {median_normalized_flat.shape} "
+        f"does not match the bias shape {avg_bias.shape}."
+    )
+
+
+def get_exposure_seconds(header):
+    """Read exposure time from a common FITS header keyword."""
+    for keyword in ("EXPTIME", "EXPOSURE", "EXP_TIME"):
+        if keyword in header:
+            return float(header[keyword])
+
+    raise KeyError(
+        "No exposure-time keyword found in this FITS header. "
+        "Check the header and enter that image's exposure time manually."
+    )
+
+
+calibrated_images = {}
+
+for science_path in science_files:
+    if not science_path.exists():
+        raise FileNotFoundError(f"Science image not found: {science_path}")
+
+    science_raw = fits.getdata(science_path)
+    header = fits.getheader(science_path)
+
+    science = science_raw.astype(np.float32) / 16.0 + 1.0
+
+    science_exposure = get_exposure_seconds(header)
+    print(f"\n{science_path.name}: {science_exposure} seconds")
+
+    dark_exposure = min(
+        dark_by_exposure,
+        key=lambda duration: abs(duration - science_exposure)
+    )
+    dark_image = dark_by_exposure[dark_exposure]
+
+    scaled_dark = (science_exposure / dark_exposure) * dark_image
+
+    calibrated = (
+        science
+        - scaled_dark
+        - avg_bias
+    ) / median_normalized_flat
+
+    calibrated_images[science_path.stem] = calibrated
+
+    print("Selected dark:", dark_exposure, "seconds")
+    print("Calibrated image shape:", calibrated.shape)
+
+    plt.figure(figsize=(8, 8))
+    plt.imshow(
+        calibrated,
+        cmap="gray",
+        origin="lower",
+        vmin=np.percentile(calibrated, 1),
+        vmax=np.percentile(calibrated, 99),
+    )
+    plt.colorbar(label="ADU")
+    plt.title(f"Calibrated {science_path.stem}")
+    plt.xlabel("Pixel x")
+    plt.ylabel("Pixel y")
+    plt.show()
+
+    output_path = science_path.with_name(
+        f"{science_path.stem}_calibrated.npy"
+    )
+    np.save(output_path, calibrated)
+    print("Saved:", output_path)
